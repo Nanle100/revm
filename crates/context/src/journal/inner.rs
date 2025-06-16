@@ -64,6 +64,8 @@ pub struct JournalInner<ENTRY> {
     pub warm_coinbase_address: Option<Address>,
     /// Precompile addresses
     pub precompiles: HashSet<Address>,
+    /// Cumulative gas refund for the transaction.
+    pub refund: u64,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -89,6 +91,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_preloaded_addresses: HashSet::default(),
             precompiles: HashSet::default(),
             warm_coinbase_address: None,
+             refund: 0,
         }
     }
 
@@ -119,6 +122,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_preloaded_addresses,
             precompiles,
             warm_coinbase_address,
+            refund,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
@@ -129,6 +133,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // Do nothing with journal history so we can skip cloning present journal.
         journal.clear();
+        *refund = 0;
+        // Clear coinbase address warming for next tx
+        *warm_coinbase_address = None;
+
+        *refund = 0;
 
         // Clear coinbase address warming for next tx
         *warm_coinbase_address = None;
@@ -155,6 +164,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_preloaded_addresses,
             warm_coinbase_address,
             precompiles,
+            refund,
         } = self;
 
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
@@ -165,6 +175,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         transient_storage.clear();
         *depth = 0;
         logs.clear();
+        *refund = 0;
         *transaction_id += 1;
         // Clear coinbase address warming for next tx
         *warm_coinbase_address = None;
@@ -190,6 +201,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_preloaded_addresses,
             warm_coinbase_address,
             precompiles,
+            refund,
         } = self;
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
@@ -207,6 +219,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *depth = 0;
         // reset transaction id.
         *transaction_id = 0;
+
+        *refund = 0;
 
         state
     }
@@ -470,6 +484,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let checkpoint = JournalCheckpoint {
             log_i: self.logs.len(),
             journal_i: self.journal.len(),
+            refund: self.refund,
         };
         self.depth += 1;
         checkpoint
@@ -497,6 +512,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             .for_each(|entry| {
                 entry.revert(state, Some(transient_storage), is_spurious_dragon_enabled);
             });
+            self.refund = checkpoint.refund;
     }
 
     /// Performs selfdestruct action.
@@ -522,11 +538,24 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let is_cold = account_load.is_cold;
         let is_empty = account_load.state_clear_aware_is_empty(spec);
 
-        if address != target {
-            // Both accounts are loaded before this point, `address` as we execute its contract.
-            // and `target` at the beginning of the function.
-            let acc_balance = self.state.get(&address).unwrap().info.balance;
+        // Collect data before mutating state
+        let acc_balance = self.state.get(&address).unwrap().info.balance;
+        let destroyed_status = {
+            let acc = self.state.get(&address).unwrap();
+            if !acc.is_selfdestructed() {
+                SelfdestructionRevertStatus::GloballySelfdestroyed
+            } else if !acc.is_selfdestructed_locally() {
+                SelfdestructionRevertStatus::LocallySelfdestroyed
+            } else {
+                SelfdestructionRevertStatus::RepeatedSelfdestruction
+            }
+        };
+        // let is_cancun_enabled = spec.is_enabled_in(CANCUN);
+        // let is_created_locally = self.state.get(&address).unwrap().is_created_locally();
+        // let is_selfdestructed = self.state.get(&address).unwrap().is_selfdestructed();
 
+        // Perform state mutations
+        if address != target {
             let target_account = self.state.get_mut(&target).unwrap();
             Self::touch_account(&mut self.journal, target, target_account);
             target_account.info.balance += acc_balance;
@@ -535,20 +564,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let acc = self.state.get_mut(&address).unwrap();
         let balance = acc.info.balance;
 
-        let destroyed_status = if !acc.is_selfdestructed() {
-            SelfdestructionRevertStatus::GloballySelfdestroyed
-        } else if !acc.is_selfdestructed_locally() {
-            SelfdestructionRevertStatus::LocallySelfdestroyed
-        } else {
-            SelfdestructionRevertStatus::RepeatedSelfdestruction
-        };
-
         let is_cancun_enabled = spec.is_enabled_in(CANCUN);
 
         // EIP-6780 (Cancun hard-fork): selfdestruct only if contract is created in the same tx
         let journal_entry = if acc.is_created_locally() || !is_cancun_enabled {
             acc.mark_selfdestructed_locally();
             acc.info.balance = U256::ZERO;
+            let refund = calculate_selfdestruct_refund(spec, acc.is_selfdestructed());
+            self.add_refund(refund);
+            //acc.info.balance = U256::ZERO;
             Some(ENTRY::account_destroyed(
                 address,
                 target,
@@ -743,6 +767,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         )
     }
 
+    /// add refund
+    pub fn add_refund(&mut self, amount: u64) {
+        self.refund = self.refund.saturating_add(amount);
+    }
+
+    ///refund
+    pub fn refund(&self) -> u64 {
+        self.refund
+    }
+
     /// Stores storage slot.
     ///
     /// And returns (original,present,new) slot value.
@@ -762,6 +796,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // if there is no original value in dirty return present value, that is our original.
         let slot = acc.storage.get_mut(&key).unwrap();
+        let original_value = slot.original_value();
+        let present_value = present.data;
 
         // new value is same as present, we don't need to do anything
         if present.data == new {
@@ -778,11 +814,24 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.journal
             .push(ENTRY::storage_changed(address, key, present.data));
         // insert value into present state.
-        slot.present_value = new;
+        // slot.present_value = new;
+        // Ok(StateLoad::new(
+        //     SStoreResult {
+        //         original_value: slot.original_value(),
+        //         present_value: present.data,
+        //         new_value: new,
+        //     },
+        //     present.is_cold,
+            slot.present_value = new;
+
+        // Calculate refund (EIP-3529)
+        let refund = calculate_sstore_refund(original_value, present_value, new, self.spec);
+        self.add_refund(refund);
+
         Ok(StateLoad::new(
             SStoreResult {
-                original_value: slot.original_value(),
-                present_value: present.data,
+                original_value,
+                present_value,
                 new_value: new,
             },
             present.is_cold,
@@ -893,4 +942,24 @@ fn reset_preloaded_addresses(
         return;
     }
     warm_preloaded_addresses.clone_from(precompiles);
+}
+
+fn calculate_sstore_refund(original: U256, present: U256, new: U256, spec: SpecId) -> u64 {
+    if !spec.is_enabled_in(LONDON) {
+        return 0;
+    }
+    // EIP-3529: Refund 4800 gas for clearing a non-zero slot to zero
+    if original != U256::ZERO && present != U256::ZERO && new == U256::ZERO {
+        4800
+    } else {
+        0 // Add other cases if needed (e.g., negative refunds are avoided)
+    }
+}
+
+fn calculate_selfdestruct_refund(spec: SpecId, is_selfdestructed: bool) -> u64 {
+    if spec.is_enabled_in(CANCUN) && is_selfdestructed {
+        0 // EIP-6780: No refund for repeated selfdestruct after Cancun
+    } else {
+        24000 // Standard selfdestruct refund
+    }
 }

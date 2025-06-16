@@ -250,6 +250,8 @@ pub struct JournalCheckpoint {
     pub log_i: usize,
     /// Checkpoint to where on revert we will go back to and revert other journal entries.
     pub journal_i: usize,
+    /// Cumulative gas refund for the transaction at this checkpoint.
+    pub refund: u64,
 }
 
 /// State load information that contains the data and if the account or storage is cold loaded
